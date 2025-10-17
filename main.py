@@ -26,8 +26,6 @@ from openpyxl.utils import get_column_letter
 
 import streamlit as st
 from io import BytesIO
-import tempfile
-import os
 
 # Global constants
 DATE_COL_RE = re.compile(r"^\s*\d{1,2}/\d{1,2}(?:/\d{2,4})?\s*$")  # e.g., 10/19, 11/2, 11/16/2024
@@ -46,19 +44,21 @@ def find_single_file(folder: Path) -> Path:
     return candidates[0]
 
 
-def load_table(path: Path) -> pd.DataFrame:
+def _normalize_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize headers, trim strings, and drop empty columns."""
+
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.map(lambda x: "" if pd.isna(x) else str(x).strip())
+    return df.loc[:, ~(df == "").all(axis=0)]
+
+
+def load_table_from_path(path: Path) -> pd.DataFrame:
     if path.suffix.lower() == ".csv":
         df = pd.read_csv(path, dtype=str)
     else:
         df = pd.read_excel(path, dtype=str, engine="openpyxl")
 
-    # Normalize header whitespace
-    df.columns = [str(c).strip() for c in df.columns]
-
-    # Drop empty/blank columns
-    df = df.map(lambda x: "" if pd.isna(x) else str(x).strip())
-    df = df.loc[:, ~(df == "").all(axis=0)]
-    return df
+    return _normalize_table(df)
 
 
 def detect_date_and_key_cols(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
@@ -180,6 +180,124 @@ def format_value_changes_stacked(key_cols: List[str], date_cols: List[str],
     return result[cols_order]
 
 
+def prepare_diff_results(df_before: pd.DataFrame, df_after: pd.DataFrame):
+    """Prepare comparison DataFrames and metadata for report generation."""
+
+    warnings = []
+    key_cols_b, date_cols_b = detect_date_and_key_cols(df_before)
+    key_cols_a, date_cols_a = detect_date_and_key_cols(df_after)
+
+    if date_cols_b != date_cols_a:
+        if set(date_cols_b) != set(date_cols_a):
+            raise SystemExit(
+                f"Date columns differ.\nBefore: {date_cols_b}\nAfter : {date_cols_a}"
+            )
+        df_after = df_after[key_cols_a + date_cols_b]
+        date_cols_a = date_cols_b
+
+    if key_cols_b != key_cols_a:
+        shared_keys = [c for c in key_cols_b if c in key_cols_a]
+        if not shared_keys:
+            raise SystemExit("No shared key columns found between BEFORE and AFTER.")
+        warnings.append(
+            "Warning: key column names differ between files. Using shared columns for alignment."
+        )
+        df_before_keys = shared_keys
+        df_after_keys = shared_keys
+    else:
+        df_before_keys = key_cols_b
+        df_after_keys = key_cols_a
+
+    df_before_num = coerce_numeric_dates(df_before, date_cols_b)
+    df_after_num = coerce_numeric_dates(df_after, date_cols_a)
+
+    idx_before = make_key_index(df_before_num, df_before_keys)
+    idx_after = make_key_index(df_after_num, df_after_keys)
+
+    agg_funcs = {c: "sum" for c in date_cols_b}
+    dfb = df_before_num.groupby(idx_before, dropna=False).agg({**{k: "first" for k in df_before_keys}, **agg_funcs})
+    dfa = df_after_num.groupby(idx_after, dropna=False).agg({**{k: "first" for k in df_after_keys}, **agg_funcs})
+
+    keys_before = list(dict.fromkeys(idx_before))
+    keys_after = list(dict.fromkeys(idx_after))
+
+    dfb_index_set = set(dfb.index)
+    dfa_index_set = set(dfa.index)
+
+    added_keys = [k for k in keys_after if k not in dfb_index_set]
+    removed_keys = [k for k in keys_before if k not in dfa_index_set]
+    shared_keys = [k for k in keys_before if k in dfa_index_set]
+
+    added_rows = (
+        dfa.loc[added_keys].reset_index()
+        if added_keys
+        else pd.DataFrame(columns=["__key__"] + df_after.columns.tolist())
+    )
+    removed_rows = (
+        dfb.loc[removed_keys].reset_index()
+        if removed_keys
+        else pd.DataFrame(columns=["__key__"] + df_before.columns.tolist())
+    )
+
+    if shared_keys:
+        dfb_shared = dfb.loc[shared_keys, date_cols_b]
+        dfa_shared = dfa.loc[shared_keys, date_cols_b]
+    else:
+        dfb_shared = pd.DataFrame(columns=date_cols_b)
+        dfa_shared = pd.DataFrame(columns=date_cols_b)
+
+    value_changes = format_value_changes_stacked(df_before_keys, date_cols_b, dfb_shared, dfa_shared)
+
+    if not dfb_shared.empty:
+        total_before = dfb_shared.sum().rename("total_before")
+        total_after = dfa_shared.sum().rename("total_after")
+        total_delta = (total_after - total_before).rename("total_delta")
+        summary = pd.concat([total_before, total_after, total_delta], axis=1).reset_index().rename(
+            columns={"index": "date"}
+        )
+    else:
+        summary = pd.DataFrame(columns=["date", "total_before", "total_after", "total_delta"])
+
+    return {
+        "value_changes": value_changes,
+        "added_rows": added_rows.reset_index(drop=True),
+        "removed_rows": removed_rows.reset_index(drop=True),
+        "summary": summary,
+        "date_cols": date_cols_b,
+        "num_key_cols": len(df_before_keys),
+        "warnings": warnings,
+    }
+
+
+def write_diff_report(results, output):
+    """Write the comparison report to a file path or file-like buffer."""
+
+    with pd.ExcelWriter(output, engine="openpyxl") as xw:
+        results["value_changes"].to_excel(xw, index=False, sheet_name="value_changes")
+        results["added_rows"].to_excel(xw, index=False, sheet_name="added_rows")
+        results["removed_rows"].to_excel(xw, index=False, sheet_name="removed_rows")
+        results["summary"].to_excel(xw, index=False, sheet_name="summary")
+
+        ws = xw.sheets["value_changes"]
+        apply_formatting_to_value_changes(ws, results["date_cols"], results["num_key_cols"])
+
+        row_idx = 2
+        max_row = ws.max_row
+        num_key_cols = results["num_key_cols"]
+        while row_idx <= max_row:
+            row_type = ws.cell(row=row_idx, column=num_key_cols + 1).value
+            if row_type == "delta":
+                before_idx = row_idx + 1
+                after_idx = row_idx + 2
+                if after_idx <= max_row:
+                    ws.row_dimensions.group(before_idx, after_idx, outline_level=1)
+                    ws.row_dimensions[before_idx].hidden = True
+                    ws.row_dimensions[after_idx].hidden = True
+                row_idx = after_idx + 1
+            else:
+                row_idx += 1
+
+
 def format_date_header(col_name):
     """Convert date column header to simple date format"""
     try:
@@ -247,110 +365,29 @@ def main(base_dir: str = "."):
     print(f"BEFORE: {before_file}")
     print(f"AFTER : {after_file}")
 
-    df_before = load_table(before_file)
-    df_after = load_table(after_file)
+    df_before = load_table_from_path(before_file)
+    df_after = load_table_from_path(after_file)
 
-    key_cols_b, date_cols_b = detect_date_and_key_cols(df_before)
-    key_cols_a, date_cols_a = detect_date_and_key_cols(df_after)
+    results = prepare_diff_results(df_before, df_after)
 
-    if date_cols_b != date_cols_a:
-        if set(date_cols_b) != set(date_cols_a):
-            sys.exit(f"Date columns differ.\nBefore: {date_cols_b}\nAfter : {date_cols_a}")
-        else:
-            df_after = df_after[key_cols_a + date_cols_b]
-            date_cols_a = date_cols_b
-
-    if key_cols_b != key_cols_a:
-        print("Warning: key column names differ between files. Using BEFORE's column order for alignment.")
-        shared_keys = [c for c in key_cols_b if c in key_cols_a]
-        if not shared_keys:
-            sys.exit("No shared key columns found between BEFORE and AFTER.")
-        df_before_keys = shared_keys
-        df_after_keys = shared_keys
-    else:
-        df_before_keys = key_cols_b
-        df_after_keys = key_cols_a
-
-    df_before = coerce_numeric_dates(df_before, date_cols_b)
-    df_after = coerce_numeric_dates(df_after, date_cols_a)
-
-    idx_before = make_key_index(df_before, df_before_keys)
-    idx_after = make_key_index(df_after, df_after_keys)
-
-    agg_funcs = {c: "sum" for c in date_cols_b}
-    dfb = df_before.groupby(idx_before, dropna=False).agg({**{k: "first" for k in df_before_keys}, **agg_funcs})
-    dfa = df_after.groupby(idx_after, dropna=False).agg({**{k: "first" for k in df_after_keys}, **agg_funcs})
-
-    keys_before = set(dfb.index)
-    keys_after = set(dfa.index)
-
-    # Preserve original order from input files instead of sorting
-    before_order = list(dict.fromkeys(idx_before))  # Remove duplicates while preserving order
-    after_order = list(dict.fromkeys(idx_after))
-
-    added_keys = [k for k in after_order if k not in keys_before]
-    removed_keys = [k for k in before_order if k not in keys_after]
-    shared_keys = [k for k in before_order if k in keys_after]
-
-    added_rows = dfa.loc[added_keys].reset_index() if added_keys else pd.DataFrame(
-        columns=["__key__"] + df_after.columns.tolist())
-    removed_rows = dfb.loc[removed_keys].reset_index() if removed_keys else pd.DataFrame(
-        columns=["__key__"] + df_before.columns.tolist())
-
-    dfb_shared = dfb.loc[shared_keys, date_cols_b]
-    dfa_shared = dfa.loc[shared_keys, date_cols_b]
-
-    value_changes = format_value_changes_stacked(df_before_keys, date_cols_b, dfb_shared, dfa_shared)
-
-    total_before = dfb_shared.sum().rename("total_before")
-    total_after = dfa_shared.sum().rename("total_after")
-    total_delta = (total_after - total_before).rename("total_delta")
-    summary = pd.concat([total_before, total_after, total_delta], axis=1).reset_index().rename(
-        columns={"index": "date"})
+    for warning in results.get("warnings", []):
+        print(warning)
 
     out_path = base / "diff_report.xlsx"
-    with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
-        value_changes.to_excel(xw, index=False, sheet_name="value_changes")
-        added_rows.reset_index(drop=True).to_excel(xw, index=False, sheet_name="added_rows")
-        removed_rows.reset_index(drop=True).to_excel(xw, index=False, sheet_name="removed_rows")
-        summary.to_excel(xw, index=False, sheet_name="summary")
-
-        # Apply formatting to value_changes sheet
-        ws = xw.sheets["value_changes"]
-        num_key_cols = len([c for c in value_changes.columns if c.startswith("key_")])
-        apply_formatting_to_value_changes(ws, date_cols_b, num_key_cols)
-
-        # Group and hide before/after rows
-        row_idx = 2
-        while row_idx <= ws.max_row:
-            row_type = ws.cell(row=row_idx, column=num_key_cols + 1).value
-            if row_type == "delta":
-                # Group the before and after rows (next 2 rows after delta)
-                before_idx = row_idx + 1
-                after_idx = row_idx + 2
-                if after_idx <= ws.max_row:
-                    ws.row_dimensions.group(before_idx, after_idx, outline_level=1)
-                    # Hide the grouped rows
-                    ws.row_dimensions[before_idx].hidden = True
-                    ws.row_dimensions[after_idx].hidden = True
-                row_idx = after_idx + 1
-            else:
-                row_idx += 1
+    write_diff_report(results, out_path)
 
     print(f"Wrote: {out_path}")
 
 
-def load_table(file_bytes, filename):
-    """Load table from uploaded file"""
-    if filename.endswith('.csv'):
+def load_table_from_upload(file_bytes, filename):
+    """Load table from uploaded file."""
+
+    if filename.lower().endswith(".csv"):
         df = pd.read_csv(file_bytes, dtype=str)
     else:
         df = pd.read_excel(file_bytes, dtype=str, engine="openpyxl")
 
-    df.columns = [str(c).strip() for c in df.columns]
-    df = df.map(lambda x: "" if pd.isna(x) else str(x).strip())
-    df = df.loc[:, ~(df == "").all(axis=0)]
-    return df
+    return _normalize_table(df)
 
 
 st.set_page_config(page_title="Excel Diff Tool", layout="wide")
@@ -367,31 +404,66 @@ with col2:
     st.subheader("After File")
     after_file = st.file_uploader("Upload AFTER file", type=['xlsx', 'xls', 'csv'], key='after')
 
+if "report_bytes" not in st.session_state:
+    st.session_state.report_bytes = None
+    st.session_state.summary_df = None
+    st.session_state.uploaded_pair = None
+    st.session_state.report_warnings = []
+
+
 if before_file and after_file:
     try:
+        current_pair = (before_file.name, after_file.name)
+        if st.session_state.uploaded_pair != current_pair:
+            st.session_state.report_bytes = None
+            st.session_state.summary_df = None
+            st.session_state.uploaded_pair = current_pair
+            st.session_state.report_warnings = []
+
         st.info("Processing files...")
 
-        df_before = load_table(before_file, before_file.name)
-        df_after = load_table(after_file, after_file.name)
+        df_before = load_table_from_upload(before_file, before_file.name)
+        df_after = load_table_from_upload(after_file, after_file.name)
 
         st.success("✓ Files loaded successfully")
 
-        # Display preview
         with st.expander("Preview: Before File"):
-            st.dataframe(df_before.head(), use_container_width=True)
+            st.dataframe(df_before.head(), width="stretch")
 
         with st.expander("Preview: After File"):
-            st.dataframe(df_after.head(), use_container_width=True)
+            st.dataframe(df_after.head(), width="stretch")
 
-        # Run comparison
         if st.button("🔍 Generate Comparison Report"):
-            # Insert your original main() logic here, adapted for the web UI
-            st.write("Report generation in progress...")
-            # This is where you'd call your comparison functions
-            # and create the Excel output
+            try:
+                results = prepare_diff_results(df_before, df_after)
+                report_buffer = BytesIO()
+                write_diff_report(results, report_buffer)
+                report_buffer.seek(0)
+
+                st.session_state.report_bytes = report_buffer.getvalue()
+                st.session_state.summary_df = results["summary"]
+                st.session_state.report_warnings = results.get("warnings", [])
+
+            except SystemExit as exc:
+                st.error(str(exc))
+            except Exception as exc:  # pragma: no cover - safety net for unexpected errors
+                st.error(f"Error generating report: {exc}")
+
+        if st.session_state.report_bytes:
+            for warning in st.session_state.report_warnings:
+                st.warning(warning)
 
             st.success("Report generated! Click below to download:")
-            # st.download_button(...)
+            st.download_button(
+                label="⬇️ Download Comparison Report",
+                data=st.session_state.report_bytes,
+                file_name="diff_report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            if st.session_state.summary_df is not None and not st.session_state.summary_df.empty:
+                st.subheader("Summary Totals")
+                st.dataframe(st.session_state.summary_df, width="stretch")
 
     except Exception as e:
         st.error(f"Error: {str(e)}")
